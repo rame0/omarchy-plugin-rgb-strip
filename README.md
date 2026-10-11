@@ -16,7 +16,10 @@ that advertises GATT service `fff0` and takes 9-byte commands on `fff3`.
 ## Requirements
 
 - Omarchy 4.x with `omarchy-shell`
-- BlueZ, `busctl` (systemd), `jq`
+- `bluez` and `bluez-utils` (`bluetoothctl`), `busctl` (systemd), `jq`
+
+All of these are part of the stock Omarchy install, so there is nothing extra
+to set up.
 
 No pairing is needed. The phone app must not be connected at the same time:
 these controllers accept one connection.
@@ -31,8 +34,13 @@ Then open the widget, press the gear, then **Scan for strips**, and add yours.
 
 ## Command line
 
-Everything goes through `bin/rgbctl`, which the widget also uses, so it can be
-bound to keys or hooks as well:
+The widget drives the strips through `rgbctl`, a script that ships with the
+plugin in `bin/rgbctl`. It is not installed system-wide; to use it from a
+terminal, keybindings or hooks, put it on your `PATH`:
+
+```bash
+ln -s ~/.config/omarchy/plugins/rame0.rgb/bin/rgbctl ~/.local/bin/rgbctl
+```
 
 ```bash
 rgbctl scan                 # nearby controllers, JSON
