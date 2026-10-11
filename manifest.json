@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "rame0.rgb",
+  "name": "RGB Strips",
+  "version": "0.1.0",
+  "author": "rame0",
+  "license": "MIT",
+  "description": "Control BLE RGB LED strip controllers (ELK-BLEDOM family) from the bar, without the vendor app",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "RGB Strips",
+    "description": "Power, color, brightness and effects for BLE LED strips",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "tintIcon": true,
+      "wheelStep": 10,
+      "pollInterval": 5
+    },
+    "schema": [
+      { "key": "tintIcon", "type": "boolean", "label": "Tint the icon with the strip color", "defaultValue": true },
+      { "key": "wheelStep", "type": "integer", "label": "Brightness step on scroll (%)", "min": 1, "max": 50, "step": 1, "defaultValue": 10 },
+      { "key": "pollInterval", "type": "integer", "label": "Connection check while open (seconds)", "min": 2, "max": 60, "step": 1, "defaultValue": 5 }
+    ]
+  },
+  "homepage": "https://github.com/rame0/omarchy-plugin-rgb-strip"
+}

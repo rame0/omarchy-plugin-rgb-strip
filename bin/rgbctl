@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+# rgbctl: drive ELK-BLEDOM-family BLE LED strip controllers through BlueZ D-Bus.
+# No vendor app, no extra packages: busctl, bluetoothctl and jq only.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+EFFECTS=$HERE/effects.json
+CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-rgb
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-rgb
+CACHE_DIR=${XDG_RUNTIME_DIR:-/tmp}/omarchy-rgb
+DEVICES=$CONFIG_DIR/devices.json
+STATE=$STATE_DIR/state.json
+ADAPTER=${RGBCTL_ADAPTER:-hci0}
+
+SERVICE_UUID=0000fff0-0000-1000-8000-00805f9b34fb
+WRITE_UUID=0000fff3-0000-1000-8000-00805f9b34fb
+
+usage() {
+  cat <<'EOF'
+Usage: rgbctl <command> [args] [target]
+
+  target is a MAC, a device name, or "all" (the default).
+
+  on | off | toggle [target]
+  color <rrggbb> [target]        static color, stops any effect
+  brightness <0-100> [target]
+  effect <id> [target]           ids from `rgbctl effects`
+  speed <0-100> [target]         effect speed
+  restore [target]               resend the last known state
+  connect | disconnect [target]
+
+  scan [seconds]                 JSON list of nearby controllers
+  add <mac> [name]
+  remove <mac>
+  rename <mac> <name>
+  order <mac> <rgb|rbg|grb|gbr|brg|bgr>   channel order of the strip
+  list                           configured devices with their state
+  status                         connection state per configured device
+  effects                        JSON list of effects
+EOF
+}
+
+die() { echo "rgbctl: $*" >&2; exit 1; }
+
+init_files() {
+  mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$CACHE_DIR"
+  [[ -s $DEVICES ]] || echo '{"devices":[]}' >"$DEVICES"
+  [[ -s $STATE ]] || echo '{}' >"$STATE"
+}
+
+# Rewritten in place, not renamed over: the shell watches these files by inode.
+update_json() {
+  local file=$1 out
+  shift
+  exec 9>"$STATE_DIR/lock"
+  flock 9
+  out=$(jq "$@" "$file")
+  printf '%s\n' "$out" >"$file"
+  exec 9>&-
+}
+
+norm_mac() {
+  local mac=${1^^}
+  [[ $mac =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]] || die "not a MAC address: $1"
+  echo "$mac"
+}
+
+dev_path() { echo "/org/bluez/$ADAPTER/dev_${1//:/_}"; }
+
+prop() { busctl get-property org.bluez "$1" "$2" "$3" 2>/dev/null; }
+
+# Device names and MACs from devices.json; "all" or empty means every one.
+resolve_targets() {
+  local target=${1:-all}
+  if [[ $target == all ]]; then
+    jq -r '.devices[].mac' "$DEVICES"
+    return
+  fi
+  local hit
+  hit=$(jq -r --arg t "$target" '.devices[] | select((.mac | ascii_upcase) == ($t | ascii_upcase) or .name == $t) | .mac' "$DEVICES")
+  [[ -n $hit ]] || die "unknown device: $target"
+  echo "$hit"
+}
+
+# Unpaired LE devices drop out of BlueZ once forgotten; a short scan brings them back.
+ensure_known() {
+  local path
+  path=$(dev_path "$1")
+  prop "$path" org.bluez.Device1 Address >/dev/null && return 0
+  bluetoothctl --timeout 10 scan le >/dev/null 2>&1 &
+  local scan=$! i
+  for i in $(seq 40); do
+    if prop "$path" org.bluez.Device1 Address >/dev/null; then
+      kill "$scan" 2>/dev/null || true
+      wait "$scan" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.25
+  done
+  kill "$scan" 2>/dev/null || true
+  wait "$scan" 2>/dev/null || true
+  return 1
+}
+
+ensure_connected() {
+  local mac=$1 path i
+  path=$(dev_path "$mac")
+  ensure_known "$mac" || { echo "rgbctl: $mac is out of range" >&2; return 1; }
+  if [[ $(prop "$path" org.bluez.Device1 Connected) != "b true" ]]; then
+    busctl --timeout=15 call org.bluez "$path" org.bluez.Device1 Connect >/dev/null ||
+      { echo "rgbctl: could not connect to $mac" >&2; return 1; }
+  fi
+  for i in $(seq 40); do
+    [[ $(prop "$path" org.bluez.Device1 ServicesResolved) == "b true" ]] && return 0
+    sleep 0.25
+  done
+  echo "rgbctl: $mac connected but its services never resolved" >&2
+  return 1
+}
+
+# GATT object paths change between connections, so the cached one is checked first.
+write_char() {
+  local mac=$1 path cache c p
+  path=$(dev_path "$mac")
+  cache=$CACHE_DIR/${mac//:/_}
+  c=$(cat "$cache" 2>/dev/null || true)
+  if [[ -z $c || $(prop "$c" org.bluez.GattCharacteristic1 UUID) != "s \"$WRITE_UUID\"" ]]; then
+    c=""
+    for p in $(busctl tree --list org.bluez 2>/dev/null | grep -E "^$path/service[0-9a-f]+/char[0-9a-f]+$"); do
+      if [[ $(prop "$p" org.bluez.GattCharacteristic1 UUID) == "s \"$WRITE_UUID\"" ]]; then
+        c=$p
+        break
+      fi
+    done
+    [[ -n $c ]] || { echo "rgbctl: $mac has no fff3 characteristic" >&2; return 1; }
+    echo "$c" >"$cache"
+  fi
+  echo "$c"
+}
+
+send() {
+  local mac=$1 c
+  shift
+  ensure_connected "$mac" || return 1
+  c=$(write_char "$mac") || return 1
+  busctl call org.bluez "$c" org.bluez.GattCharacteristic1 WriteValue 'aya{sv}' "$#" "$@" 1 type s command
+}
+
+# Every command is a 9-byte frame: 7e 00 <op> <a> <b> <c> <d> 00 ef.
+frame() { printf '0x7e 0x00 %s %s %s %s %s 0x00 0xef' "$@"; }
+
+frame_power() {
+  if [[ $1 == true ]]; then frame 0x04 0xf0 0x00 0x01 0xff
+  else frame 0x04 0x00 0x00 0x00 0xff; fi
+}
+
+frame_color() {
+  local hex=$1 order=$2 r g b
+  r=$((16#${hex:0:2})) g=$((16#${hex:2:2})) b=$((16#${hex:4:2}))
+  local -A ch=([r]=$r [g]=$g [b]=$b)
+  frame 0x05 0x03 "${ch[${order:0:1}]}" "${ch[${order:1:1}]}" "${ch[${order:2:1}]}"
+}
+
+frame_brightness() { frame 0x01 "$1" 0x00 0x00 0x00; }
+frame_effect() { frame 0x03 "$1" 0x03 0x00 0x00; }
+frame_speed() { frame 0x02 "$1" 0x00 0x00 0x00; }
+
+device_order() {
+  jq -r --arg m "$1" '(.devices[] | select(.mac == $m) | .order) // "rgb"' "$DEVICES"
+}
+
+state_of() { jq -r --arg m "$1" --arg k "$2" '.[$m][$k] // empty' "$STATE"; }
+
+save_state() {
+  local mac=$1 patch=$2
+  update_json "$STATE" --arg m "$mac" --argjson p "$patch" '.[$m] = ((.[$m] // {}) + $p)'
+}
+
+percent() {
+  [[ $1 =~ ^[0-9]+$ ]] && (($1 <= 100)) || die "expected 0-100, got: $1"
+  echo "$1"
+}
+
+effect_code() {
+  local code
+  code=$(jq -r --arg id "$1" '.[] | select(.id == $id) | .code' "$EFFECTS")
+  [[ -n $code ]] || die "unknown effect: $1 (see: rgbctl effects)"
+  echo "$code"
+}
+
+# Runs <fn mac> for every target, keeps going past a device that fails.
+for_targets() {
+  local fn=$1 target=${2:-all} mac failed=0
+  local macs
+  macs=$(resolve_targets "$target")
+  [[ -n $macs ]] || die "no devices configured (rgbctl scan, then rgbctl add <mac>)"
+  for mac in $macs; do
+    "$fn" "$mac" || failed=1
+  done
+  return $failed
+}
+
+do_power() {
+  # shellcheck disable=SC2046
+  send "$1" $(frame_power "$POWER") >/dev/null && save_state "$1" "{\"power\":$POWER}"
+}
+
+do_color() {
+  # shellcheck disable=SC2046
+  send "$1" $(frame_color "$COLOR" "$(device_order "$1")") >/dev/null &&
+    save_state "$1" "{\"color\":\"#$COLOR\",\"effect\":\"\"}"
+}
+
+do_brightness() {
+  # shellcheck disable=SC2046
+  send "$1" $(frame_brightness "$VALUE") >/dev/null && save_state "$1" "{\"brightness\":$VALUE}"
+}
+
+do_effect() {
+  # shellcheck disable=SC2046
+  send "$1" $(frame_effect "$CODE") >/dev/null && save_state "$1" "{\"effect\":\"$EFFECT\"}"
+}
+
+do_speed() {
+  # shellcheck disable=SC2046
+  send "$1" $(frame_speed "$VALUE") >/dev/null && save_state "$1" "{\"speed\":$VALUE}"
+}
+
+do_restore() {
+  local mac=$1 color effect brightness speed power
+  power=$(state_of "$mac" power)
+  color=$(state_of "$mac" color)
+  effect=$(state_of "$mac" effect)
+  brightness=$(state_of "$mac" brightness)
+  speed=$(state_of "$mac" speed)
+  # shellcheck disable=SC2046
+  {
+    send "$mac" $(frame_power "${power:-true}") >/dev/null || return 1
+    [[ -n $brightness ]] && send "$mac" $(frame_brightness "$brightness") >/dev/null
+    if [[ -n $effect ]]; then
+      send "$mac" $(frame_effect "$(effect_code "$effect")") >/dev/null
+      [[ -n $speed ]] && send "$mac" $(frame_speed "$speed") >/dev/null
+    elif [[ -n $color ]]; then
+      send "$mac" $(frame_color "${color#\#}" "$(device_order "$mac")") >/dev/null
+    fi
+    true
+  }
+}
+
+do_connect() { ensure_connected "$1"; }
+
+do_disconnect() {
+  busctl call org.bluez "$(dev_path "$1")" org.bluez.Device1 Disconnect >/dev/null 2>&1 || true
+}
+
+cmd_scan() {
+  local secs=${1:-6} p mac name uuids
+  bluetoothctl --timeout "$secs" scan le >/dev/null 2>&1 || true
+  {
+    for p in $(busctl tree --list org.bluez 2>/dev/null | grep -E "^/org/bluez/$ADAPTER/dev_[0-9A-F_]+$"); do
+      uuids=$(prop "$p" org.bluez.Device1 UUIDs || true)
+      [[ $uuids == *"$SERVICE_UUID"* ]] || continue
+      mac=$(prop "$p" org.bluez.Device1 Address | sed -E 's/^s "(.*)"$/\1/')
+      name=$(prop "$p" org.bluez.Device1 Alias | sed -E 's/^s "(.*)"$/\1/')
+      jq -cn --arg mac "$mac" --arg name "$name" '{mac: $mac, name: $name}'
+    done
+  } | jq -s --slurpfile d "$DEVICES" 'map(. + {added: (.mac as $m | $d[0].devices | any(.mac == $m))})'
+}
+
+cmd_add() {
+  local mac name path
+  mac=$(norm_mac "${1:?mac required}")
+  path=$(dev_path "$mac")
+  name=${2:-$(prop "$path" org.bluez.Device1 Alias | sed -E 's/^s "(.*)"$/\1/' || true)}
+  name=${name:-$mac}
+  update_json "$DEVICES" --arg m "$mac" --arg n "$name" \
+    'if any(.devices[]; .mac == $m) then . else .devices += [{mac: $m, name: $n, order: "rgb"}] end'
+  # Trusted keeps BlueZ from forgetting an unpaired device between sessions.
+  busctl set-property org.bluez "$path" org.bluez.Device1 Trusted b true 2>/dev/null || true
+}
+
+cmd_remove() {
+  local mac
+  mac=$(norm_mac "${1:?mac required}")
+  do_disconnect "$mac"
+  update_json "$DEVICES" --arg m "$mac" '.devices |= map(select(.mac != $m))'
+  update_json "$STATE" --arg m "$mac" 'del(.[$m])'
+}
+
+cmd_rename() {
+  local mac
+  mac=$(norm_mac "${1:?mac required}")
+  [[ -n ${2:-} ]] || die "name required"
+  update_json "$DEVICES" --arg m "$mac" --arg n "$2" '.devices |= map(if .mac == $m then .name = $n else . end)'
+}
+
+cmd_order() {
+  local mac
+  mac=$(norm_mac "${1:?mac required}")
+  [[ ${2:-} =~ ^(rgb|rbg|grb|gbr|brg|bgr)$ ]] || die "order must be one of rgb rbg grb gbr brg bgr"
+  update_json "$DEVICES" --arg m "$mac" --arg o "$2" '.devices |= map(if .mac == $m then .order = $o else . end)'
+}
+
+cmd_status() {
+  local mac path out="{}"
+  for mac in $(jq -r '.devices[].mac' "$DEVICES"); do
+    path=$(dev_path "$mac")
+    out=$(jq -c --arg m "$mac" \
+      --argjson present "$(prop "$path" org.bluez.Device1 Address >/dev/null && echo true || echo false)" \
+      --argjson connected "$([[ $(prop "$path" org.bluez.Device1 Connected) == "b true" ]] && echo true || echo false)" \
+      '.[$m] = {present: $present, connected: $connected}' <<<"$out")
+  done
+  echo "$out"
+}
+
+main() {
+  init_files
+  local cmd=${1:-}
+  [[ $# -gt 0 ]] && shift
+  case $cmd in
+    on | off)
+      POWER=$([[ $cmd == on ]] && echo true || echo false)
+      for_targets do_power "${1:-all}"
+      ;;
+    toggle)
+      local any_on mac
+      any_on=false
+      for mac in $(resolve_targets "${1:-all}"); do
+        [[ $(state_of "$mac" power) == true ]] && any_on=true
+      done
+      POWER=$([[ $any_on == true ]] && echo false || echo true)
+      for_targets do_power "${1:-all}"
+      ;;
+    color)
+      COLOR=${1:?color required}
+      COLOR=${COLOR#\#}
+      COLOR=${COLOR,,}
+      [[ $COLOR =~ ^[0-9a-f]{6}$ ]] || die "color must be rrggbb, got: $1"
+      for_targets do_color "${2:-all}"
+      ;;
+    brightness)
+      VALUE=$(percent "${1:?value required}")
+      for_targets do_brightness "${2:-all}"
+      ;;
+    effect)
+      EFFECT=${1:?effect required}
+      CODE=$(effect_code "$EFFECT")
+      for_targets do_effect "${2:-all}"
+      ;;
+    speed)
+      VALUE=$(percent "${1:?value required}")
+      for_targets do_speed "${2:-all}"
+      ;;
+    restore) for_targets do_restore "${1:-all}" ;;
+    connect) for_targets do_connect "${1:-all}" ;;
+    disconnect) for_targets do_disconnect "${1:-all}" ;;
+    scan) cmd_scan "$@" ;;
+    add) cmd_add "$@" ;;
+    remove) cmd_remove "$@" ;;
+    rename) cmd_rename "$@" ;;
+    order) cmd_order "$@" ;;
+    list) jq --slurpfile s "$STATE" '.devices | map(. + {state: ($s[0][.mac] // {})})' "$DEVICES" ;;
+    status) cmd_status ;;
+    effects) cat "$EFFECTS" ;;
+    -h | --help | help | "") usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

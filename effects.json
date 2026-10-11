@@ -1,0 +1,23 @@
+[
+  { "id": "jump-rgb", "code": 135, "label": "Jump: RGB" },
+  { "id": "jump-7", "code": 136, "label": "Jump: 7 colors" },
+  { "id": "fade-7", "code": 137, "label": "Fade: 7 colors" },
+  { "id": "fade-red", "code": 139, "label": "Fade: red" },
+  { "id": "fade-green", "code": 140, "label": "Fade: green" },
+  { "id": "fade-blue", "code": 141, "label": "Fade: blue" },
+  { "id": "fade-yellow", "code": 142, "label": "Fade: yellow" },
+  { "id": "fade-cyan", "code": 143, "label": "Fade: cyan" },
+  { "id": "fade-magenta", "code": 144, "label": "Fade: magenta" },
+  { "id": "fade-white", "code": 145, "label": "Fade: white" },
+  { "id": "fade-red-green", "code": 146, "label": "Fade: red / green" },
+  { "id": "fade-red-blue", "code": 147, "label": "Fade: red / blue" },
+  { "id": "fade-green-blue", "code": 148, "label": "Fade: green / blue" },
+  { "id": "blink-7", "code": 149, "label": "Blink: 7 colors" },
+  { "id": "blink-red", "code": 150, "label": "Blink: red" },
+  { "id": "blink-green", "code": 151, "label": "Blink: green" },
+  { "id": "blink-blue", "code": 152, "label": "Blink: blue" },
+  { "id": "blink-yellow", "code": 153, "label": "Blink: yellow" },
+  { "id": "blink-cyan", "code": 154, "label": "Blink: cyan" },
+  { "id": "blink-magenta", "code": 155, "label": "Blink: magenta" },
+  { "id": "blink-white", "code": 156, "label": "Blink: white" }
+]
