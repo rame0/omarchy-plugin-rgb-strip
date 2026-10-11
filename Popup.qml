@@ -106,17 +106,6 @@ KeyboardPanel {
 
           PanelActionButton {
             anchors.verticalCenter: parent.verticalCenter
-            visible: popup.devicesView
-            enabled: !popup.service.scanning
-            iconText: Model.Glyph.scan
-            tooltipText: "Scan for strips"
-            foreground: popup.foreground
-            fontFamily: popup.fontFamily
-            onClicked: popup.service.scan()
-          }
-
-          PanelActionButton {
-            anchors.verticalCenter: parent.verticalCenter
             visible: !popup.devicesView
             iconText: Model.Glyph.devices
             tooltipText: "Strips"
@@ -468,14 +457,23 @@ KeyboardPanel {
           fontFamily: popup.fontFamily
         }
 
+        Button {
+          text: popup.service.scanning ? "Scanning…" : "Scan for strips"
+          iconText: Model.Glyph.scan
+          iconSpinning: popup.service.scanning
+          enabled: !popup.service.scanning
+          foreground: popup.foreground
+          fontFamily: popup.fontFamily
+          bordered: true
+          onClicked: popup.service.scan()
+        }
+
         Text {
           width: parent.width
-          visible: popup.service.scanning || !popup.service.scanned || popup.service.scanResults.length === 0
+          visible: popup.service.scanned && !popup.service.scanning && popup.service.scanResults.length === 0
           textFormat: Text.PlainText
           wrapMode: Text.WordWrap
-          text: popup.service.scanning ? "Scanning…"
-            : (popup.service.scanned ? "No controllers found. Make sure the phone app is not connected to it."
-              : "Press scan to look for controllers.")
+          text: "No controllers found. Make sure the phone app is not connected to it."
           color: popup.foreground
           opacity: 0.7
           font.family: popup.fontFamily

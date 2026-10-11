@@ -27,7 +27,7 @@ these controllers accept one connection.
 omarchy plugin add https://github.com/rame0/omarchy-plugin-rgb-strip.git --enable
 ```
 
-Then open the widget, press the gear, scan, and add your strip.
+Then open the widget, press the gear, then **Scan for strips**, and add yours.
 
 ## Command line
 
